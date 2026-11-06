@@ -1,313 +1,214 @@
 import os
-import json
 import logging
-import pandas as pd
-import joblib
-import re
-import string
 import traceback
 from urllib.parse import urlparse
-from django.shortcuts import render, redirect, get_object_or_404
-from django.http import JsonResponse
-from django.contrib.auth.decorators import login_required
-from django.views.decorators.http import require_http_methods
-from django.views.decorators.csrf import csrf_exempt
-from .models import SubmittedNews
-from sklearn.metrics.pairwise import cosine_similarity
-from difflib import get_close_matches
-import numpy as np
 
-# Import ML utilities
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+
+from .models import SubmittedNews
+from .model import ml_utils
 from .model.ml_utils import (
     preprocess_text as clean_text,
     extract_article_text_from_url,
-    append_news_to_csv,
-    retrain_model,
     reload_model_and_vectorizer,
     trusted_domains,
-    model,
-    vectorizer,
     DATA_DIR,
 )
-
 
 logger = logging.getLogger(__name__)
 reload_model_and_vectorizer()
 
 
-def home(request):
-    return render(request, 'detection/home.html')
-
-@login_required
-def my_submissions(request):
-    news_list = SubmittedNews.objects.filter(user=request.user).order_by('-created_at')
-    return render(request, 'detection/my_submissions.html', {'news_list': news_list})
-
-def review_news(request):
-    news_list = SubmittedNews.objects.all()
-    return render(request, 'review_news.html', {'news_list': news_list})
-
-# ---------------------- CHECK / SUBMIT NEWS ----------------------
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def check_news(request):
-    try:
-        data = json.loads(request.body)
-        user_input = data.get("text", "").strip()
-        if not user_input:
-            return JsonResponse({"error": "Text input is required."}, status=400)
-
-        if model and vectorizer:
-            cleaned_input = clean_text(user_input)  
-            vect = vectorizer.transform([cleaned_input])
-            pred = model.predict(vect)[0]
-            result = "True" if pred == 1 else "Fake"
-            return JsonResponse({"result": result})
-        else:
-            return JsonResponse({"error": "Model or vectorizer not loaded."}, status=500)
-    except Exception:
-        return JsonResponse({"error": "Invalid JSON."}, status=400)
-
-@csrf_exempt
-@login_required
-@require_http_methods(["POST"])
-def submit_news(request):
-    try:
-        data = json.loads(request.body)
-        news_text = data.get("text") or data.get("content") or ""
-        user_title = data.get("title", "").strip()
-
-        if not news_text.strip():
-            return JsonResponse({"error": "No text provided."}, status=400)
-
-        def generate_title(text):
-            return text.split('.')[0].strip()[:100] if '.' in text else text.strip()[:100]
-
-        title = user_title or generate_title(news_text)
-
-        SubmittedNews.objects.create(user=request.user, title=title, content=news_text)
-
-        return JsonResponse({"message": "News received!", "title": title, "content": news_text})
-
-    except Exception:
-        return JsonResponse({"error": "Invalid JSON."}, status=400)
+def _label(pred):
+    return "True" if pred == 1 else "Fake"
 
 
-
-# ---------------------- ANALYZE (Guest) ----------------------
-
-
-# Paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, 'detection', 'model', 'lr_model.jb')
-VECTORIZER_PATH = os.path.join(BASE_DIR, 'detection', 'model', 'vectorizer.jb')
-
-try:
-    model = joblib.load(MODEL_PATH)
-    vectorizer = joblib.load(VECTORIZER_PATH)
-    print(" Model and Vectorizer loaded successfully")
-except Exception as e:
-    model = None
-    vectorizer = None
-    print(f" Error loading model/vectorizer: {e}")
+def _is_trusted(domain):
+    domain = domain.lower().split(':')[0]
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    for t in trusted_domains:
+        t = t.lower().removeprefix('www.')
+        if domain == t or domain.endswith('.' + t):
+            return True
+    return False
 
 
-# ---------------------- UNIFIED ANALYZE ----------------------
-MAX_INPUT_LENGTH = 5000
-
-@csrf_exempt
-@require_http_methods(["POST"]) 
-def analyze(request):
-
-    try:
-        data = json.loads(request.body)
-        user_input = data.get('user_input', '').strip()
-        method = data.get('method', '').strip()
-
-        if not user_input or not method:
-            return JsonResponse({'error': 'Missing input or method.'}, status=400)
-
-        # -------------------- 1. Direct Input --------------------
-        if method == 'input':
-            vect = vectorizer.transform([clean_text(user_input)])
-            pred = model.predict(vect)[0]
-            proba = model.predict_proba(vect)[0]
-            return JsonResponse({
-                "result": "True" if pred == 1 else "Fake",
-                "confidence": round(max(proba) * 100, 2),
-                "article_text": user_input
-            })
-
-        # -------------------- 2. Dataset Check --------------------
-        elif method == 'dataset':
-            df_real = pd.read_csv(os.path.join(DATA_DIR, 'True.csv'), on_bad_lines='skip')
-            df_fake = pd.read_csv(os.path.join(DATA_DIR, 'Fake.csv'), on_bad_lines='skip')
-
-            df_real['label'] = 'True'
-            df_fake['label'] = 'Fake'
-            df = pd.concat([df_real[['title','text','label']], df_fake[['title','text','label']]], ignore_index=True)
-
-            df['combined'] = (df['title'].fillna('') + ' ' + df['text'].fillna('')).apply(clean_text)
-
-            cleaned_input = clean_text(user_input)
-            dataset_vectors = vectorizer.transform(df['combined'])
-            user_vector = vectorizer.transform([cleaned_input])
-
-            similarity_scores = cosine_similarity(user_vector, dataset_vectors)[0]
-
-            top_indices = similarity_scores.argsort()[::-1]
-            
-            top_matches = []
-            for idx in top_indices[:5]:
-                if similarity_scores[idx] < 0.01:  # lower threshold to catch more matches
-                    continue
-
-                article_text = df.iloc[idx]['text'] or ''
-                article_vector = vectorizer.transform([clean_text(article_text)])
-                pred = model.predict(article_vector)[0]
-                predicted_label = 'True' if pred == 1 else 'Fake'
-                actual_label = df.iloc[idx]['label']  # from CSV
-
-                top_matches.append({
-                    'title': df.iloc[idx]['title'] or 'No Title',
-                    'text': article_text[:300],
-                    'predicted': predicted_label,
-                    'actual': actual_label,
-                    'similarity': round(float(similarity_scores[idx]), 3),
-                    'correct': predicted_label == actual_label
-                })
-
-
-            if top_matches:
-                real_votes = sum(1 for a in top_matches if a['actual'] == 'True')
-                fake_votes = sum(1 for a in top_matches if a['actual'] == 'Fake')
-
-                if real_votes > fake_votes:
-                    final_pred = 'True'
-                elif fake_votes > real_votes:
-                    final_pred = 'Fake'
-                else:
-                    pred = model.predict(user_vector)[0]
-                    final_pred = "True" if pred == 1 else "Fake"
-
-                return JsonResponse({
-                    "result": f"{final_pred} (based on similar articles)",
-                    "article_text": user_input,
-                    "articles": top_matches,
-                    "found_matches": True
-                })
-            else:
-                pred = model.predict(user_vector)[0]
-                prediction = "True" if pred == 1 else "Fake"
-                return JsonResponse({
-                    "result": prediction,
-                    "article_text": user_input,
-                    "articles": [],
-                    "found_matches": False
-                })
-
-        # -------------------- 3. URL Check --------------------
-       
-        elif method == 'url':
-            domain = urlparse(user_input).netloc.lower()
-            article_text = extract_article_text_from_url(user_input)
-
-            if any(trusted in domain for trusted in trusted_domains):
-                return JsonResponse({
-                    "result": "True (Trusted Source)",
-                    "article_text": article_text or "No article content found."
-                })
-            elif article_text and model and vectorizer:
-                cleaned_article = clean_text(article_text)
-                vect = vectorizer.transform([cleaned_article])
-                pred = model.predict(vect)[0]
-                result = "True" if pred == 1 else "Fake"
-                return JsonResponse({
-                    "result": result,
-                    "article_text": article_text
-                })
-            else:
-                return JsonResponse({
-                    "result": "Unable to analyze this URL",
-                    "article_text": "No article content found."
-                })
-
-        else:
-            return JsonResponse({'error': 'Invalid method. Use "input", "dataset" or "url"'}, status=400)
-
-    except Exception as e:
-        print(f"[ERROR] analyze failed: {e}")
-        traceback.print_exc()
-        return JsonResponse({'error': str(e)}, status=500)
-
-# ---------------------- USER CONTRIBUTIONS ----------------------
-
-@login_required
-def get_contributions(request):
-    contributions = SubmittedNews.objects.filter(user=request.user).order_by('-created_at')
-    data = [{
+def _serialize(c):
+    return {
         "id": c.id,
         "title": c.title,
         "content": c.content,
         "is_approved": c.is_approved,
         "created_at": c.created_at.isoformat(),
-    } for c in contributions]
-    return JsonResponse(data, safe=False)
+        "submitted_at": c.submitted_at.isoformat(),
+    }
 
-@csrf_exempt
-@login_required
-@require_http_methods(["PUT"])
-def edit_contribution(request, id):
+
+# ANALYZE (guest, no login) 
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def analyze(request):
+    user_input = (request.data.get('user_input') or '').strip()
+    method = (request.data.get('method') or '').strip()
+    if method == 'text':
+        method = 'input'
+
+    if not user_input or not method:
+        return Response({'error': 'Missing input or method.'}, status=400)
+
+    # Always read from ml_utils so a retrain/reload is picked up immediately
+    model, vectorizer = ml_utils.model, ml_utils.vectorizer
+    if model is None or vectorizer is None:
+        return Response({'error': 'Model or vectorizer not loaded.'}, status=500)
+
     try:
-        data = json.loads(request.body)
-        title = data.get("title", "").strip()
-        content = data.get("content", "").strip()
+        # 1. Direct text
+        if method == 'input':
+            vect = vectorizer.transform([clean_text(user_input)])
+            pred = model.predict(vect)[0]
+            proba = model.predict_proba(vect)[0]
+            return Response({
+                "result": _label(pred),
+                "confidence": round(float(max(proba)) * 100, 2),
+                "article_text": user_input,
+            })
 
-        if not title or not content:
-            return JsonResponse({"error": "Title and content required."}, status=400)
+        # 2. Dataset similarity
+        if method == 'dataset':
+            df_real = pd.read_csv(os.path.join(DATA_DIR, 'True.csv'), on_bad_lines='skip')
+            df_fake = pd.read_csv(os.path.join(DATA_DIR, 'Fake.csv'), on_bad_lines='skip')
+            df_real['label'] = 'True'
+            df_fake['label'] = 'Fake'
+            df = pd.concat(
+                [df_real[['title', 'text', 'label']], df_fake[['title', 'text', 'label']]],
+                ignore_index=True,
+            )
+            df['title'] = df['title'].fillna('')
+            df['text'] = df['text'].fillna('')
+            df['combined'] = (df['title'] + ' ' + df['text']).apply(clean_text)
 
-        contribution = SubmittedNews.objects.get(id=id, user=request.user)
-        contribution.title = title
-        contribution.content = content
-        contribution.save()
+            user_vector = vectorizer.transform([clean_text(user_input)])
+            dataset_vectors = vectorizer.transform(df['combined'])
+            scores = cosine_similarity(user_vector, dataset_vectors)[0]
 
-        return JsonResponse({"message": "Contribution updated successfully!"})
+            top_matches = []
+            for idx in scores.argsort()[::-1][:5]:
+                if scores[idx] < 0.01:
+                    continue
+                article_text = df.iloc[idx]['text']
+                article_vector = vectorizer.transform([clean_text(article_text)])
+                predicted = _label(model.predict(article_vector)[0])
+                actual = df.iloc[idx]['label']
+                top_matches.append({
+                    'title': df.iloc[idx]['title'] or 'No Title',
+                    'text': article_text[:300],
+                    'predicted': predicted,
+                    'actual': actual,
+                    'similarity': round(float(scores[idx]), 3),
+                    'correct': predicted == actual,
+                })
 
-    except SubmittedNews.DoesNotExist:
-        return JsonResponse({"error": "Contribution not found."}, status=404)
+            if top_matches:
+                real_votes = sum(1 for a in top_matches if a['actual'] == 'True')
+                fake_votes = sum(1 for a in top_matches if a['actual'] == 'Fake')
+                if real_votes > fake_votes:
+                    final = 'True'
+                elif fake_votes > real_votes:
+                    final = 'Fake'
+                else:
+                    final = _label(model.predict(user_vector)[0])
+                return Response({
+                    "result": f"{final} (based on similar articles)",
+                    "article_text": user_input,
+                    "articles": top_matches,
+                    "found_matches": True,
+                })
+
+            return Response({
+                "result": _label(model.predict(user_vector)[0]),
+                "article_text": user_input,
+                "articles": [],
+                "found_matches": False,
+            })
+
+        # 3. URL
+        if method == 'url':
+            parsed = urlparse(user_input)
+            if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                return Response({'error': 'Enter a valid http(s) URL.'}, status=400)
+
+            article_text = extract_article_text_from_url(user_input)
+
+            if _is_trusted(parsed.netloc):
+                return Response({
+                    "result": "True (Trusted Source)",
+                    "article_text": article_text or "No article content found.",
+                })
+            if article_text:
+                vect = vectorizer.transform([clean_text(article_text)])
+                return Response({
+                    "result": _label(model.predict(vect)[0]),
+                    "article_text": article_text,
+                })
+            return Response({
+                "result": "Unable to analyze this URL",
+                "article_text": "No article content found.",
+            })
+
+        return Response({'error': 'Invalid method. Use "text", "dataset" or "url".'}, status=400)
+
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        logger.error("analyze failed: %s", e)
+        traceback.print_exc()
+        return Response({'error': str(e)}, status=500)
 
-@csrf_exempt
-@login_required
-@require_http_methods(["DELETE"])
-def delete_contribution(request, id):
+
+#  USER CONTRIBUTIONS (login required) 
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def contributions(request):
+    if request.method == 'GET':
+        qs = SubmittedNews.objects.filter(user=request.user).order_by('-created_at')
+        return Response([_serialize(c) for c in qs])
+
+    title = (request.data.get('title') or '').strip()
+    content = (request.data.get('content') or request.data.get('text') or '').strip()
+    if not content:
+        return Response({'error': 'No text provided.'}, status=400)
+
+    if not title:
+        title = (content.split('.')[0] if '.' in content else content).strip()[:100]
+
+    obj = SubmittedNews.objects.create(user=request.user, title=title, content=content)
+    return Response({'message': 'News received!', 'contribution': _serialize(obj)}, status=201)
+
+
+@api_view(['PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def contribution_detail(request, id):
     try:
-        contribution = SubmittedNews.objects.get(id=id, user=request.user)
-        contribution.delete()
-        return JsonResponse({"message": "Contribution deleted successfully."})
+        obj = SubmittedNews.objects.get(id=id, user=request.user)
     except SubmittedNews.DoesNotExist:
-        return JsonResponse({"error": "Contribution not found or unauthorized."}, status=404)
+        return Response({'error': 'Contribution not found.'}, status=404)
 
-# ---------------------- ADMIN APPROVAL ----------------------
+    if request.method == 'DELETE':
+        obj.delete()
+        return Response({'message': 'Contribution deleted successfully.'})
 
-@csrf_exempt
-@login_required  # Optional: restrict to staff only using @staff_member_required
-def update_status(request, news_id, action):
-    news_item = get_object_or_404(SubmittedNews, id=news_id)
+    title = (request.data.get('title') or '').strip()
+    content = (request.data.get('content') or '').strip()
+    if not title or not content:
+        return Response({'error': 'Title and content required.'}, status=400)
 
-    if action == "approve":
-        news_item.is_approved = True
-        label = 'True'
-    elif action == "disapprove":
-        news_item.is_approved = False
-        label = 'Fake'
-    else:
-        return redirect('review_news')
-
-    news_item.save()
-    append_news_to_csv(title=news_item.title, text=news_item.content, label=label)
-    retrain_model()
-    reload_model_and_vectorizer()
-    return redirect('review_news')
+    obj.title = title
+    obj.content = content
+    obj.save()
+    return Response({'message': 'Contribution updated successfully!', 'contribution': _serialize(obj)})
